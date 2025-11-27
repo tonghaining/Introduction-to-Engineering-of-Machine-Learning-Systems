@@ -39,7 +39,9 @@ All the web services forwarding
 Directly forward so that localhost:80 on the remote-mlops machine is routed to 8080
 ssh -L [port on your machine]:[address from remote machine's perspective that you want to forward]:[port from remote perspective] [remote machine address from your perspective (or alias)]
 
+```
 ssh -N -L 8080:localhost:80 remote-mlops
+```
 
 If you want to simulate connecting to remote VIA the 'local' machine
 ```
