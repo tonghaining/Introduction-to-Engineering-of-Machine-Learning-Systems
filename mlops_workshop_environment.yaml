@@ -1,4 +1,4 @@
-name: mlops_eng
+name: mlops_workshop
 channels:
   - conda-forge
   - defaults
