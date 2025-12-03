@@ -16,6 +16,14 @@ HTTPS_ORIGIN = "https://github.com/tonghaining/Introduction-to-Engineering-of-Ma
 CONNECT_TIMEOUT = 10
 DEFAULT_IDENTITY_PATH = "~/.ssh/config"
 DEFAULT_TEMPLATE_PATH = Path("ssh_config.template")
+TARGET_INGRESSES = [
+    "kfp-ingress",
+    "mlflow-ingress",
+    "mlflow-minio-ingress",
+    "grafana-ingress",
+    "prometheus-ingress",
+    "evidently-monitor-ingress",
+]
 
 URLS_TO_CHECK = [
     "kserve-gateway.local",
@@ -80,6 +88,12 @@ class Client:
         return None
 
 
+@dataclass
+class RemoteTarget:
+    client: Client
+    remote_ip: str
+
+
 def read_and_fill(csv_path: Path):
     with csv_path.open(newline="") as f:
         rows = list(csv.reader(f))
@@ -135,7 +149,7 @@ def build_clients(headers: List[str], filled_rows: List[List[str]]) -> List[Clie
     return clients
 
 
-def ssh_base(ip: str, key_path: Path) -> List[str]:
+def ssh_base(ip: str, key_path: Path, *, user: str = "student") -> List[str]:
     return [
         "ssh",
         "-i",
@@ -146,18 +160,34 @@ def ssh_base(ip: str, key_path: Path) -> List[str]:
         f"ConnectTimeout={CONNECT_TIMEOUT}",
         "-o",
         "StrictHostKeyChecking=accept-new",
-        f"student@{ip}",
+        f"{user}@{ip}",
     ]
 
 
-def ssh_run(ip: str, key_path: Path, remote_cmd: str, *, check: bool = True, capture_output: bool = False):
-    cmd = ssh_base(ip, key_path) + [remote_cmd]
+def ssh_run(
+    ip: str,
+    key_path: Path,
+    remote_cmd: str,
+    *,
+    user: str = "student",
+    check: bool = True,
+    capture_output: bool = False,
+):
+    cmd = ssh_base(ip, key_path, user=user) + [remote_cmd]
     return run(cmd, check=check, capture_output=capture_output)
 
 
-def ssh_run_with_input(ip: str, key_path: Path, remote_cmd: str, input_text: str):
-    cmd = ssh_base(ip, key_path) + [remote_cmd]
-    return run(cmd, input_text=input_text)
+def ssh_run_with_input(
+    ip: str,
+    key_path: Path,
+    remote_cmd: str,
+    input_text: str,
+    *,
+    user: str = "student",
+    check: bool = True,
+):
+    cmd = ssh_base(ip, key_path, user=user) + [remote_cmd]
+    return run(cmd, input_text=input_text, check=check)
 
 
 def repo_exists(ip: str, key_path: Path, repo_path: str) -> bool:
@@ -272,6 +302,40 @@ def pick_clients(all_clients: List[Client], ips: Optional[List[str]], operate_on
     return picked
 
 
+def pick_remote_targets(all_clients: List[Client], remote_ips: Optional[List[str]], operate_on_all: bool) -> List[RemoteTarget]:
+    ip_to_client: dict[str, Client] = {}
+    for client in all_clients:
+        rip = client.preferred_remote_ip()
+        if not rip:
+            continue
+        if rip not in ip_to_client:
+            ip_to_client[rip] = client
+
+    if operate_on_all:
+        if not ip_to_client:
+            raise SystemExit("No remote IPs found in CSV.")
+        return [RemoteTarget(client=c, remote_ip=ip) for ip, c in ip_to_client.items()]
+
+    if not remote_ips:
+        raise SystemExit("Specify --all or at least one --remote-ip when using --patch-access")
+
+    picked: List[RemoteTarget] = []
+    for target_ip in remote_ips:
+        matched_client = None
+        chosen_ip = None
+        for ip, client in ip_to_client.items():
+            if target_ip == ip or target_ip == client.remote_public_ip or target_ip == client.remote_internal_ip:
+                matched_client = client
+                chosen_ip = target_ip
+                break
+        if not matched_client or not chosen_ip:
+            raise SystemExit(f"Remote IP not found in CSV: {target_ip}")
+        if all(r.remote_ip != chosen_ip for r in picked):
+            picked.append(RemoteTarget(client=matched_client, remote_ip=chosen_ip))
+
+    return picked
+
+
 def write_key_to_temp(key_material: str, tmpdir: Path, label: str) -> Path:
     key_path = tmpdir / f"{label}_id_ed25519"
     key_text = key_material
@@ -313,6 +377,109 @@ def process_client(client: Client, key_path: Path, args):
 
     run_connectivity_check(target_ip, key_path)
     print(f"[{client.label}] Connectivity checks completed.")
+
+
+def patch_remote_access(target: RemoteTarget, key_path: Path, args):
+    remote_ip = target.remote_ip
+    client = target.client
+    print(f"\n== {client.label} remote ({remote_ip}) row {client.row_index} ==")
+
+    def render_script(dry_run: bool) -> str:
+        script = textwrap.dedent(
+            """\
+        import json
+        import subprocess
+        import sys
+
+        TARGET_INGRESSES = __TARGET_LIST__
+        WHITELIST = ["127.0.0.0/8", "192.168.0.0/16", "10.244.0.0/16", "172.16.0.0/12"]
+        DRY_RUN = __DRY_RUN__
+
+        def run(cmd):
+            return subprocess.run(cmd, text=True, capture_output=True)
+
+        whitelist_str = ", ".join(WHITELIST)
+        print("Computed whitelist:", whitelist_str)
+
+        ing_res = run(["kubectl", "get", "ingress", "-A", "-o", "json"])
+        if ing_res.returncode != 0:
+            print("kubectl get ingress failed:", ing_res.stderr.strip())
+            sys.exit(1)
+
+        try:
+            data = json.loads(ing_res.stdout)
+        except Exception as exc:
+            print("Failed to parse kubectl output:", exc)
+            sys.exit(1)
+
+        items = data.get("items", [])
+        found = 0
+        for item in items:
+            meta = item.get("metadata", {}) or {}
+            name = meta.get("name")
+            if name not in TARGET_INGRESSES:
+                continue
+            ns = meta.get("namespace")
+            annotations = meta.get("annotations") or {}
+            current = annotations.get(
+                "nginx.ingress.kubernetes.io/whitelist-source-range",
+                "<none>",
+            )
+            print(f"{ns}/{name}: current whitelist={current}")
+            found += 1
+            if DRY_RUN:
+                continue
+            backup_path = f"{name}_ingress.conf"
+            try:
+                with open(backup_path, "w", encoding="utf-8") as bf:
+                    bf.write(str(current))
+                print(f"{ns}/{name}: saved current whitelist to {backup_path}")
+            except Exception as exc:
+                print(f"{ns}/{name}: failed to write backup: {exc}")
+            patch_obj = {
+                "metadata": {
+                    "annotations": {
+                        "nginx.ingress.kubernetes.io/whitelist-source-range": whitelist_str
+                    }
+                }
+            }
+            patch_json = json.dumps(patch_obj)
+            patch_res = run(
+                ["kubectl", "patch", "ingress", "-n", ns, name, "--type", "merge", "-p", patch_json]
+            )
+            if patch_res.returncode != 0:
+                print(f"{ns}/{name}: patch failed: {patch_res.stderr.strip()}")
+            else:
+                print(f"{ns}/{name}: patched to {whitelist_str}")
+
+        if not found:
+            print("No target ingresses found.")
+        """
+        )
+        script = script.replace("__TARGET_LIST__", repr(TARGET_INGRESSES))
+        script = script.replace("__DRY_RUN__", str(bool(dry_run)))
+        return script
+
+    def run_remote(dry_run: bool):
+        script = render_script(dry_run)
+        try:
+            return ssh_run_with_input(remote_ip, key_path, "python3 -", input_text=script, user="ubuntu")
+        except subprocess.CalledProcessError as exc:
+            print(f"[{client.label}] remote script failed (dry_run={dry_run}):", exc.stderr.strip() if exc.stderr else exc)
+            raise
+
+    # Always show status first
+    status_res = run_remote(dry_run=True)
+    if args.dry_run:
+        return status_res
+
+    skip_prompt = args.all and args.force
+    if not skip_prompt:
+        if not prompt_confirm(f"Patch ingress whitelist on {client.label} remote {remote_ip}?"):
+            print(f"[{client.label}] Skipped patch by user.")
+            return
+
+    run_remote(dry_run=False)
 
 
 def render_config(template_text: str, client_ip: str, remote_ip: str, identity_path: str) -> str:
@@ -371,9 +538,15 @@ def main():
     )
     ap.add_argument("--preprocess", action="store_true", help="Fill empty CSV cells and write processed CSV, then exit.")
     ap.add_argument("--client-ip", action="append", help="Operate on a specific client IP (public or csc-internal).")
+    ap.add_argument("--remote-ip", action="append", help="Operate on a specific remote VM IP (public or csc-internal).")
     ap.add_argument("--all", action="store_true", help="Operate on all clients listed in the CSV.")
     ap.add_argument("--force", action="store_true", help="Skip confirmations (only honored together with --all).")
     ap.add_argument("--dry-run", action="store_true", help="Show git status/commit without changing anything.")
+    ap.add_argument(
+        "--patch-access",
+        action="store_true",
+        help="Patch ingress whitelist on remote VMs (uses remote IPs from the CSV).",
+    )
     ap.add_argument(
         "--repo-path",
         default=REPO_PATH,
@@ -398,6 +571,9 @@ def main():
 
     args = ap.parse_args()
 
+    if args.patch_access and args.package:
+        raise SystemExit("--patch-access cannot be combined with --package")
+
     csv_path = Path(args.csv)
     if not csv_path.exists():
         raise SystemExit(f"CSV not found: {csv_path}")
@@ -409,6 +585,20 @@ def main():
         return
 
     clients = build_clients(headers, filled_rows)
+
+    if args.patch_access:
+        remote_targets = pick_remote_targets(clients, args.remote_ip, args.all)
+        with tempfile.TemporaryDirectory() as td:
+            tmpdir = Path(td)
+            for target in remote_targets:
+                client = target.client
+                if not client.private_key.strip():
+                    print(f"[{client.label}] Missing private key in CSV, skipping.")
+                    continue
+                key_path = write_key_to_temp(client.private_key, tmpdir, client.label)
+                patch_remote_access(target, key_path, args)
+        return
+
     targets = pick_clients(clients, args.client_ip, args.all)
 
     if args.package:
