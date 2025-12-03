@@ -1,0 +1,14 @@
+apiVersion: "serving.kserve.io/v1beta1"
+kind: "InferenceService"
+metadata:
+  name: "wine-model-workshop"
+  namespace: kserve-inference
+  annotations:
+    prometheus/io/scrape: "true"
+spec:
+  predictor:
+    serviceAccountName: kserve-sa # created when deploying the MLOps platform, associating with the secret that contains the username and password of the MLflow's MinIO server
+    model:
+      modelFormat: 
+        name: sklearn
+      storageUri: "s3://mlflow/49/56acb756eede4b05850f96ad0c5efde5/artifacts/wine-quality" # change to the S3 URI of your model artifact
