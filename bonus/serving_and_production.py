@@ -12,7 +12,7 @@ import time
 !kubectl get isvc wine-model-workshop -n kserve-inference -w
 #%%
 # check pods
-!kubectl get pods -n kserve-inference -l sergtving.kserve.io/inferenceservice=wine-model-workshop
+!kubectl get pods -n kserve-inference -l serving.kserve.io/inferenceservice=wine-model-workshop
 #%%
 # Send some requests
 from utils import send_requests
