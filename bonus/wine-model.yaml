@@ -1,7 +1,7 @@
 apiVersion: "serving.kserve.io/v1beta1"
 kind: "InferenceService"
 metadata:
-  name: "wine-model-workshop2"
+  name: "wine-model-workshop"
   namespace: kserve-inference
   # annotations:
   #   prometheus/io/scrape: "true"
@@ -11,5 +11,6 @@ spec:
     model:
       modelFormat: 
         name: sklearn
-      #storageUri: "s3://mlflow/49/56acb756eede4b05850f96ad0c5efde5/artifacts/wine-quality" # change to the S3 URI of your model artifact
-      storageUri: "s3://mlflow/8/e1181c1b1bcd442fba6e8a0d700427d5/artifacts/model"
+      storageUri: "s3://mlflow/8/e1181c1b1bcd442fba6e8a0d700427d5/artifacts/model" # replace
+      # minio at localhost:9001 has paths like: mlflow/1/1d549a9d646e4e11968493208b8a868d/artifacts/model replace it to the above
+      # make sure to include the s3:// in front
